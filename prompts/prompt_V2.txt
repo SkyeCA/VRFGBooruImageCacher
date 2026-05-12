@@ -1,0 +1,41 @@
+Act as an expert Node.js backend developer. I need you to build an edge-cache proxy API using Express, Axios, Sharp, and Canvas. 
+
+Context: This API sits between a VRChat world (the client) and an Oxibooru/Szurubooru server (the remote host). VRChat has strict limitations on image sizes, concurrent requests, and error handling. Your goal is to fetch media and metadata from the Booru, format it for VRChat, and aggressively cache it locally on disk to protect the remote server from the "thundering herd" effect of 40 players loading into a world simultaneously.
+
+Core Architecture & Configuration
+- Tech Stack: express, axios, sharp, canvas, express-rate-limit.
+- Proxy Support: Must include app.set('trust proxy', 1); for Apache PM2 deployment.
+- Config Variables: Provide variables at the top for DEBUG_MODE (boolean), BOORU_DOMAIN (e.g., 'https://vrfg.eu'), and OUTBOUND_USER_AGENT (e.g., 'VRCWorld/RandomImage').
+- Global Logging: Log the IP, Requested URL, and User-Agent of every request to a local server.log file.
+- Inbound Auth: Create a middleware that rejects requests (returns 403 "DENIED") if the User-Agent does not start with "VRChat". This is skipped if DEBUG_MODE is true.
+
+VRChat-Specific Rate Limiting (Crucial Nuance)
+Create rate limiters for the endpoints below with the following rules:
+- Limit: 3 requests per 5 seconds per IP.
+- Bypass Rule: If the requested file ID already exists in the local disk cache, SKIP the rate limit entirely.
+- HTTP 200 Error Override: VRChat's UnityWebRequest discards responses with error codes (like 429, 403, 500). If a user hits a rate limit or triggers an error, you MUST return a 200 OK HTTP status, but serve the error message inside the payload (an error image or JSON, detailed below) so the player actually sees it in-game. Add a Cache-Control: no-store header to all errors.
+
+Endpoint 1: /health
+- Returns the text "OK".
+
+Endpoint 2: /info (Metadata Proxy)
+- Accepts an id query parameter.
+- Requests JSON from ${BOORU_DOMAIN}/api/post/[ID]. Uses the OUTBOUND_USER_AGENT.
+- Extracts: id, uploader (from user.name), uploadDate (from creationTime), and tags. 
+- Tag Formatting: Map the tags array to extract just the names, and join(", ") them into a single comma-separated string.
+- Caching: Save this exact simplified JSON object to an info_cache folder on disk as [ID].json. Serve it with a Cache-Control: public, max-age=604800 (7 days) header.
+- TTL: Before serving an info file from disk, check its modified time. If it is older than 7 days, delete it and fetch a fresh copy from the Booru.
+- Errors: Return standard JSON errors (e.g., {"error": "message"}), but remember the HTTP 200 rule.
+
+Endpoint 3: /image (Media Proxy)
+- Accepts an id query parameter.
+- Requests JSON from ${BOORU_DOMAIN}/api/post/[ID] to find the contentUrl and mimeType. 
+- Validation: If the mimeType starts with video/ or is image/gif, throw an error (videos/animations rejected).
+- Processing: Download the image as a stream. Pipe it through sharp. Resize it to exactly 1920x1080 using contain, filling any empty letterbox/pillarbox space with a solid black background. Output it as a quality 90 JPEG.
+- Caching: Save the resulting JPEG to an image_cache folder on disk (filename is just the ID). Serve it with a Cache-Control: public, max-age=86400 header.
+- Errors: If anything fails, dynamically generate an 800x450 (16:9 ratio) JPEG using the canvas package. Give it a dark grey background and draw the error message in red text in the center. Remember the HTTP 200 rule.
+
+Concurrency & Cache Management (The Hard Part)
+1. Download Locks: You must use a JavaScript Map of Promises to track active downloads. If Player 1 requests an image, start the download. If Player 2 requests the same image 100ms later, they must wait for Player 1's Promise to resolve, and then both receive the newly saved file from disk. Do not hit the Booru twice. (Apply this logic to the /info endpoint as well).
+2. API Lookup Cache: Keep a memory Map of IDs to Image URLs so you don't have to hit the Booru JSON API a second time if the disk image is missing but you recently looked up the URL.
+3. Smart Disk Pruning: The image_cache must not exceed 500MB. Write an async function that runs after a successful download. If the folder is > 500MB, delete the oldest files until the folder is down to 450MB. Critical: Do NOT delete a file if it is currently locked/actively being downloaded.

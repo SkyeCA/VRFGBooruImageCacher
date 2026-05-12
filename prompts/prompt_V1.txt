@@ -1,0 +1,33 @@
+We are going to create a simple NodeJS/ Express API that can be called from a VRChat world.
+
+The API will have the following endpoints:
+
+- /image
+ - Accepts a GET request
+ - Accepts one URL parameter called "id"
+ - Only accepts requests from User-Agents starting with the string "VRChat"
+  - If this fails return a text response that say "DENIED"
+  - This should be toggleable via a debug mode.
+
+- /health
+ - Accepts a GET request
+ - Returns the string "OK"
+
+The /image endpoint needs to do several special things:
+
+- It needs to request the webpage located at https://vrfg.eu/post/[ID] where [ID] is the "id" URL parameter that was passed into the endpoint.
+- From the returned HTML we need to extract a URL, to do this we will:
+  - Find a div called post-content within the post-container div.
+  - Find the single img tag inside the post-content div.
+  - Get the string for the src tag's value.
+  - Concatenate the https://vrfg.eu URL and the src tag's value.
+  - Return the image located at that URL to the user as the response. We should stream this to users if possible so the server is more efficient.
+  - We should make sure the response headers are correct for the type of image we're returning.
+  - If we can't find an image at the https://vrfg.eu/post/[ID] URL because it returns a 404, we can't find a value in the HTML, the host isn't found, or some other error occurs we should return an image that has an error message in it.
+    - Since this is going to be used to display an image in game we can only report errors to the user via an image.
+
+The /health endpoint is a simple health check endpoint. Nothing more is needed of it.
+
+The /image endpoint should be rate limited to 30 seconds per request.
+
+The API should log any errors to a text file. The API should log the IP and requested URL of every request to a file. These logs can be the same file, or separate.
