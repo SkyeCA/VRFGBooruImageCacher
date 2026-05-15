@@ -20,6 +20,10 @@ const LOG_FILE = path.join(__dirname, 'server.log');
 const BOORU_DOMAIN = 'https://vrfg.eu';
 const OUTBOUND_USER_AGENT = 'SkyeCA/VRCWorld/BooruBrowser';
 
+// Auth Setup (NEW)
+const BOORU_USERNAME = ''; 
+const BOORU_API_TOKEN = ''; // Generate this in your Booru account settings
+
 // Image Cache Setup
 const CACHE_DIR = path.join(__dirname, 'image_cache');
 const MAX_CACHE_SIZE_BYTES = 500 * 1024 * 1024; 
@@ -75,6 +79,25 @@ const sendErrorImage = (res, errorMessage) => {
 
     const stream = canvas.createJPEGStream();
     stream.pipe(res);
+};
+
+const getAuthHeaders = () => {
+    // If credentials aren't set, return standard headers
+    if (!BOORU_USERNAME || !BOORU_API_TOKEN) {
+        return { 
+            'Accept': 'application/json', 
+            'User-Agent': OUTBOUND_USER_AGENT 
+        };
+    }
+    
+    // Szurubooru/Oxibooru requires: Token [Base64(username:token)]
+    const encodedCredentials = Buffer.from(`${BOORU_USERNAME}:${BOORU_API_TOKEN}`).toString('base64');
+    
+    return { 
+        'Accept': 'application/json',
+        'User-Agent': OUTBOUND_USER_AGENT,
+        'Authorization': `Token ${encodedCredentials}` 
+    };
 };
 
 const enforceCacheLimit = async () => {
@@ -209,7 +232,7 @@ app.get('/image', enforceVRChatAgent, imageRateLimiter, async (req, res) => {
             } else {
                 const apiUrl = `${BOORU_DOMAIN}/api/post/${postId}`;
                 const apiResponse = await axios.get(apiUrl, {
-                    headers: { 'Accept': 'application/json', 'User-Agent': OUTBOUND_USER_AGENT }
+                    headers: getAuthHeaders()
                 }).catch(err => {
                     throw new Error(`API Error (HTTP ${err.response?.status || err.message})`);
                 });
@@ -231,7 +254,7 @@ app.get('/image', enforceVRChatAgent, imageRateLimiter, async (req, res) => {
                 url: absoluteImageUrl,
                 method: 'GET',
                 responseType: 'stream',
-                headers: { 'User-Agent': OUTBOUND_USER_AGENT }
+                headers: getAuthHeaders()
             });
 
             const transformer = sharp()
@@ -304,7 +327,7 @@ app.get('/info', enforceVRChatAgent, infoRateLimiter, async (req, res) => {
         const fetchInfoProcess = (async () => {
             const apiUrl = `${BOORU_DOMAIN}/api/post/${postId}`;
             const apiResponse = await axios.get(apiUrl, {
-                headers: { 'Accept': 'application/json', 'User-Agent': OUTBOUND_USER_AGENT }
+                headers: getAuthHeaders()
             }).catch(err => {
                 throw new Error(`API Error (HTTP ${err.response?.status || err.message})`);
             });
