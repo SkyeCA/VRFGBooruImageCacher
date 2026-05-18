@@ -21,8 +21,8 @@ const BOORU_DOMAIN = 'https://vrfg.eu';
 const OUTBOUND_USER_AGENT = 'SkyeCA/VRCWorld/BooruBrowser';
 
 // Auth Setup (NEW)
-const BOORU_USERNAME = ''; 
-const BOORU_API_TOKEN = ''; // Generate this in your Booru account settings
+const BOORU_USERNAME = 'BooruWorld'; 
+const BOORU_API_TOKEN = '22de45a3-9bf7-4ab7-958c-4d7d21d87997'; // Generate this in your Booru account settings
 
 // Image Cache Setup
 const CACHE_DIR = path.join(__dirname, 'image_cache');
