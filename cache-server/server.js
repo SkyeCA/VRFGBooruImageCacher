@@ -5,6 +5,7 @@ const { createCanvas } = require('canvas');
 const fs = require('fs');
 const path = require('path');
 const sharp = require('sharp');
+const { LRUCache } = require('lru-cache');
 
 const app = express();
 app.set('trust proxy', 1); // Respect Apache's X-Forwarded-For headers
@@ -13,21 +14,21 @@ const PORT = process.env.PORT || 3000;
 // ==========================================
 // Configuration
 // ==========================================
-const DEBUG_MODE = true; 
+const DEBUG_MODE = false; 
 const LOG_FILE = path.join(__dirname, 'server.log');
 
 // Target Server Setup
 const BOORU_DOMAIN = 'https://vrfg.eu';
 const OUTBOUND_USER_AGENT = 'SkyeCA/VRCWorld/BooruBrowser';
 
-// Auth Setup (NEW)
+// Auth Setup
 const BOORU_USERNAME = ''; 
-const BOORU_API_TOKEN = ''; // Generate this in your Booru account settings
+const BOORU_API_TOKEN = ''; 
 
 // Image Cache Setup
 const CACHE_DIR = path.join(__dirname, 'image_cache');
-const MAX_CACHE_SIZE_BYTES = 500 * 1024 * 1024; 
-const TARGET_CACHE_SIZE_BYTES = 450 * 1024 * 1024; 
+const MAX_CACHE_SIZE_BYTES = 1000 * 1024 * 1024; 
+const TARGET_CACHE_SIZE_BYTES = 950 * 1024 * 1024; 
 
 if (!fs.existsSync(CACHE_DIR)) {
     fs.mkdirSync(CACHE_DIR, { recursive: true });
@@ -41,8 +42,27 @@ if (!fs.existsSync(INFO_CACHE_DIR)) {
     fs.mkdirSync(INFO_CACHE_DIR, { recursive: true });
 }
 
-// Memory Maps
-const apiCache = new Map(); 
+// Stats Cache Setup
+const STATS_CACHE_DIR = path.join(__dirname, 'stats_cache');
+
+if (!fs.existsSync(STATS_CACHE_DIR)) {
+    fs.mkdirSync(STATS_CACHE_DIR, { recursive: true });
+}
+
+// User Check-in Persistence Setup
+const CHECKIN_FILE = path.join(__dirname, 'checkins.json');
+let checkinData = {};
+
+if (fs.existsSync(CHECKIN_FILE)) {
+    try {
+        checkinData = JSON.parse(fs.readFileSync(CHECKIN_FILE, 'utf8'));
+    } catch (err) {
+        console.error("Error reading checkins file:", err);
+    }
+}
+
+// Memory Maps & Cache
+const apiCache = new LRUCache({ max: 5000 }); // Fix 1: Caps RAM usage
 const activeDownloads = new Map(); 
 const activeInfoRequests = new Map(); 
 
@@ -56,6 +76,36 @@ const logToFile = (message) => {
     fs.appendFile(LOG_FILE, logEntry, (err) => {
         if (err) console.error("Failed to write to log file:", err);
     });
+};
+
+// Debounced Disk Writing for Data Integrity
+let writeTimeout = null;
+
+const saveCheckins = () => {
+    if (writeTimeout) clearTimeout(writeTimeout);
+    
+    writeTimeout = setTimeout(() => {
+        fs.writeFile(CHECKIN_FILE, JSON.stringify(checkinData), (err) => {
+            if (err) console.error("Error saving checkins:", err);
+        });
+    }, 2000); 
+};
+
+const getDirectorySize = async (dirPath) => {
+    let totalSize = 0;
+    try {
+        if (fs.existsSync(dirPath)) {
+            const files = await fs.promises.readdir(dirPath);
+            for (const file of files) {
+                const filePath = path.join(dirPath, file);
+                const stats = await fs.promises.stat(filePath);
+                if (stats.isFile()) totalSize += stats.size;
+            }
+        }
+    } catch (err) {
+        console.error("Error calculating cache size:", err);
+    }
+    return totalSize;
 };
 
 const sendErrorImage = (res, errorMessage) => {
@@ -74,15 +124,15 @@ const sendErrorImage = (res, errorMessage) => {
 
     ctx.fillText(`Error: ${errorMessage}`, width / 2, height / 2, width - 40);
 
-    res.setHeader('Content-Type', 'image/jpeg');
-    res.setHeader('Cache-Control', 'no-store'); 
-
-    const stream = canvas.createJPEGStream();
-    stream.pipe(res);
+    if (!res.headersSent) {
+        res.setHeader('Content-Type', 'image/jpeg');
+        res.setHeader('Cache-Control', 'no-store'); 
+        const stream = canvas.createJPEGStream();
+        stream.pipe(res);
+    }
 };
 
 const getAuthHeaders = () => {
-    // If credentials aren't set, return standard headers
     if (!BOORU_USERNAME || !BOORU_API_TOKEN) {
         return { 
             'Accept': 'application/json', 
@@ -90,7 +140,6 @@ const getAuthHeaders = () => {
         };
     }
     
-    // Szurubooru/Oxibooru requires: Token [Base64(username:token)]
     const encodedCredentials = Buffer.from(`${BOORU_USERNAME}:${BOORU_API_TOKEN}`).toString('base64');
     
     return { 
@@ -151,7 +200,7 @@ const enforceVRChatAgent = (req, res, next) => {
     if (DEBUG_MODE) return next();
 
     const userAgent = req.get('User-Agent') || '';
-    if (!userAgent.startsWith('VRChat')) {
+    if (!userAgent.startsWith('VRChat') && !userAgent.startsWith("UnityWebRequest") && !userAgent.startsWith("UnityPlayer")) {
         logToFile(`DENIED | Invalid User-Agent: ${userAgent} | IP: ${req.ip}`);
         return res.status(403).send('DENIED');
     }
@@ -161,10 +210,16 @@ const enforceVRChatAgent = (req, res, next) => {
 const imageRateLimiter = rateLimit({
     windowMs: 5 * 1000,
     max: 3,
-    skip: (req, res) => {
+    // Fix 2: Asynchronous skip handler to prevent event loop blocking
+    skip: async (req, res) => {
         const postId = req.query.id;
         if (!postId) return false; 
-        return fs.existsSync(path.join(CACHE_DIR, postId));
+        try {
+            await fs.promises.access(path.join(CACHE_DIR, postId));
+            return true;
+        } catch {
+            return false;
+        }
     },
     handler: (req, res) => {
         logToFile(`RATE LIMIT EXCEEDED (/image) | IP: ${req.ip}`);
@@ -176,19 +231,30 @@ const imageRateLimiter = rateLimit({
 const infoRateLimiter = rateLimit({
     windowMs: 5 * 1000,
     max: 3,
-    skip: (req, res) => {
+    // Fix 2: Asynchronous skip handler to prevent event loop blocking
+    skip: async (req, res) => {
         const postId = req.query.id;
         if (!postId) return false; 
         
         const localFilePath = path.join(INFO_CACHE_DIR, `${postId}.json`);
-        if (fs.existsSync(localFilePath)) {
-            const stats = fs.statSync(localFilePath);
-            if (Date.now() - stats.mtimeMs < INFO_CACHE_TTL_MS) return true;
+        try {
+            const stats = await fs.promises.stat(localFilePath);
+            return (Date.now() - stats.mtimeMs < INFO_CACHE_TTL_MS);
+        } catch {
+            return false;
         }
-        return false;
     },
     handler: (req, res) => {
         logToFile(`RATE LIMIT EXCEEDED (/info) | IP: ${req.ip}`);
+        res.status(200).json({ error: "Rate Limit Exceeded: Too many requests. Please wait 5 seconds." });
+    }
+});
+
+const statsRateLimiter = rateLimit({
+    windowMs: 5 * 1000,
+    max: 3,
+    handler: (req, res) => {
+        logToFile(`RATE LIMIT EXCEEDED (/stats) | IP: ${req.ip}`);
         res.status(200).json({ error: "Rate Limit Exceeded: Too many requests. Please wait 5 seconds." });
     }
 });
@@ -219,76 +285,84 @@ app.get('/image', enforceVRChatAgent, imageRateLimiter, async (req, res) => {
         }
 
         if (activeDownloads.has(postId)) {
-            await activeDownloads.get(postId); 
+            const success = await activeDownloads.get(postId); 
+            if (!success) throw new Error("Previous download attempt failed.");
             res.setHeader('Cache-Control', 'public, max-age=86400');
             return fs.createReadStream(localFilePath).pipe(res);
         }
 
+        // Fix 4: Ensure downloadProcess always resolves to a boolean
         const downloadProcess = (async () => {
-            let absoluteImageUrl;
+            try {
+                let absoluteImageUrl;
 
-            if (apiCache.has(postId)) {
-                absoluteImageUrl = apiCache.get(postId);
-            } else {
-                const apiUrl = `${BOORU_DOMAIN}/api/post/${postId}`;
-                const apiResponse = await axios.get(apiUrl, {
-                    headers: getAuthHeaders()
-                }).catch(err => {
-                    throw new Error(`API Error (HTTP ${err.response?.status || err.message})`);
-                });
-                
-                const postData = apiResponse.data;
-                const contentType = postData.mimeType || ''; 
+                if (apiCache.has(postId)) {
+                    absoluteImageUrl = apiCache.get(postId);
+                } else {
+                    const apiUrl = `${BOORU_DOMAIN}/api/post/${postId}`;
+                    const apiResponse = await axios.get(apiUrl, {
+                        headers: getAuthHeaders()
+                    }).catch(err => {
+                        throw new Error(`API Error (HTTP ${err.response?.status || err.message})`);
+                    });
+                    
+                    const postData = apiResponse.data;
+                    const contentType = postData.mimeType || ''; 
 
-                if (!contentType) throw new Error("Could not determine media type");
-                if (contentType.startsWith('video/') || contentType === 'image/gif') {
-                     throw new Error(`Media type rejected: ${contentType}`);
+                    if (!contentType) throw new Error("Could not determine media type");
+                    if (contentType.startsWith('video/') || contentType === 'image/gif') {
+                         throw new Error(`Media type rejected: ${contentType}`);
+                    }
+                    if (!postData.contentUrl) throw new Error("JSON missing 'contentUrl'");
+                    
+                    absoluteImageUrl = new URL(postData.contentUrl, BOORU_DOMAIN).href;
+                    apiCache.set(postId, absoluteImageUrl); 
                 }
-                if (!postData.contentUrl) throw new Error("JSON missing 'contentUrl'");
-                
-                absoluteImageUrl = new URL(postData.contentUrl, BOORU_DOMAIN).href;
-                apiCache.set(postId, absoluteImageUrl); 
+
+                const imageResponse = await axios({
+                    url: absoluteImageUrl,
+                    method: 'GET',
+                    responseType: 'stream',
+                    headers: getAuthHeaders()
+                });
+
+                const transformer = sharp()
+                    .resize({
+                        width: 1920,
+                        height: 1080,
+                        fit: sharp.fit.contain,
+                        background: { r: 0, g: 0, b: 0, alpha: 1 } 
+                    })
+                    .jpeg({ quality: 90 }); 
+
+                const writer = fs.createWriteStream(localFilePath);
+                imageResponse.data.pipe(transformer).pipe(writer);
+
+                await new Promise((resolve, reject) => {
+                    writer.on('finish', resolve);
+                    writer.on('error', reject);
+                    transformer.on('error', reject);
+                });
+                return true;
+            } catch (err) {
+                // Remove the failed partial file if it exists
+                if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
+                logToFile(`ERROR | /image ID: ${postId} | Msg: ${err.message}`);
+                return false;
             }
-
-            const imageResponse = await axios({
-                url: absoluteImageUrl,
-                method: 'GET',
-                responseType: 'stream',
-                headers: getAuthHeaders()
-            });
-
-            const transformer = sharp()
-                .resize({
-                    width: 1920,
-                    height: 1080,
-                    fit: sharp.fit.contain,
-                    background: { r: 0, g: 0, b: 0, alpha: 1 } 
-                })
-                .jpeg({ quality: 90 }); 
-
-            const writer = fs.createWriteStream(localFilePath);
-            imageResponse.data.pipe(transformer).pipe(writer);
-
-            return new Promise((resolve, reject) => {
-                writer.on('finish', resolve);
-                writer.on('error', reject);
-                transformer.on('error', reject);
-            });
         })();
 
         activeDownloads.set(postId, downloadProcess);
-        await downloadProcess;
+        const success = await downloadProcess;
         activeDownloads.delete(postId);
+
+        if (!success) throw new Error("Failed to process and cache image.");
 
         res.setHeader('Cache-Control', 'public, max-age=86400');
         fs.createReadStream(localFilePath).pipe(res);
 
-        enforceCacheLimit(); 
-
     } catch (error) {
         activeDownloads.delete(postId);
-        logToFile(`ERROR | /image ID: ${postId} | Msg: ${error.message}`);
-        // Ensure VRChat sees the error image by throwing a 200 OK
         res.status(200);
         sendErrorImage(res, error.message);
     }
@@ -333,6 +407,10 @@ app.get('/info', enforceVRChatAgent, infoRateLimiter, async (req, res) => {
             });
 
             const data = apiResponse.data;
+            
+            // Fix 5: JSON safety check
+            if (!data || typeof data !== 'object') throw new Error("Invalid response payload from Booru API");
+
             const parsedTags = data.tags ? data.tags.map(t => t.names ? t.names[0] : t.name || t) : [];
 
             const metadata = {
@@ -360,9 +438,87 @@ app.get('/info', enforceVRChatAgent, infoRateLimiter, async (req, res) => {
     }
 });
 
+// --- STATS ENDPOINT ---
+app.get('/stats', enforceVRChatAgent, statsRateLimiter, async (req, res) => {
+    const localFilePath = path.join(STATS_CACHE_DIR, `booru_stats.json`);
+
+    try {
+        if (fs.existsSync(localFilePath)) {
+            const stats = await fs.promises.stat(localFilePath);
+            if (Date.now() - stats.mtimeMs < INFO_CACHE_TTL_MS) {
+                res.setHeader('Content-Type', 'application/json');
+                res.setHeader('Cache-Control', 'public, max-age=86400'); 
+                return fs.createReadStream(localFilePath).pipe(res);
+            } else {
+                await fs.promises.unlink(localFilePath).catch(() => {});
+            }
+        }
+
+        const fetchStatsProcess = (async () => {
+            const apiUrl = `${BOORU_DOMAIN}/api/info`;
+            const apiResponse = await axios.get(apiUrl, {
+                headers: getAuthHeaders()
+            }).catch(err => {
+                throw new Error(`API Error (HTTP ${err.response?.status || err.message})`);
+            });
+
+            const data = apiResponse.data;
+            const metadata = {
+                postCount: data.postCount || "Unknown",
+                diskUsage: data.diskUsage ?  (Math.round((data.diskUsage / 1073741824) * 100) / 100) : "Unknown"
+            };
+
+            await fs.promises.writeFile(localFilePath, JSON.stringify(metadata, null, 2));
+        })();
+
+        await fetchStatsProcess;
+
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Cache-Control', 'public, max-age=86400');
+        fs.createReadStream(localFilePath).pipe(res);
+
+    } catch (error) {
+        logToFile(`ERROR | /stats | Msg: ${error.message}`);
+        res.status(200).json({ error: error.message });
+    }
+});
+
+// --- CHECKIN ENDPOINT ---
+app.get('/checkin', enforceVRChatAgent, (req, res) => {
+    const ip = req.ip || req.connection.remoteAddress;
+
+    if (!checkinData[ip]) {
+        checkinData[ip] = 0;
+    }
+    
+    checkinData[ip] += 5;
+    saveCheckins();
+
+    res.status(200).json({ success: true, timeLoggedMinutes: checkinData[ip] });
+});
+
+// --- SYSTEM ENDPOINT ---
+app.get('/system', enforceVRChatAgent, async (req, res) => {
+    const uniqueUsers = Object.keys(checkinData).length;
+    const totalTimeMinutes = Object.values(checkinData).reduce((sum, time) => sum + time, 0);
+    
+    const cacheSizeBytes = await getDirectorySize(CACHE_DIR);
+    const cacheSizeMB = (cacheSizeBytes / (1024 * 1024)).toFixed(2);
+
+    res.status(200).json({
+        uniqueUsers: uniqueUsers,
+        totalTimeMinutes: totalTimeMinutes,
+        imageServerCacheSizeMB: parseFloat(cacheSizeMB)
+    });
+});
+
 // ==========================================
-// Start Server
+// Scheduled Tasks & Server Start
 // ==========================================
+
+// Fix 3: Run cache cleanup every 10 minutes independently of the endpoints
+setInterval(enforceCacheLimit, 10 * 60 * 1000);
+
 app.listen(PORT, () => {
     console.log(`Server is running on port ${PORT}`);
     console.log(`Debug Mode is: ${DEBUG_MODE ? 'ON' : 'OFF'}`);

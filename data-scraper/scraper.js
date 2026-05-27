@@ -4,7 +4,7 @@ const fs = require('fs/promises');
 const API_BASE_URL = 'https://vrfg.eu';
 const API_USERNAME = ''; // Add your username
 const API_TOKEN = '';  // Your UUID token
-const OUTPUT_FILE = 'scraped_data.json';
+const OUTPUT_FILE = 'booru_data.json';
 
 async function scrapeBooru() {
     let offset = 0;
@@ -46,7 +46,6 @@ async function scrapeBooru() {
                     
                     return {
                         id: item.id,
-                        uploadDate: item.version,
                         url: `https://imageproxy.vore.my/image?id=${item.id}`,
                         safety: item.safety,
                         tags: tagNames
@@ -71,7 +70,7 @@ async function scrapeBooru() {
 
     try {
         console.log(`Writing ${allPosts.length} processed images to ${OUTPUT_FILE}...`);
-        await fs.writeFile(OUTPUT_FILE, JSON.stringify(allPosts, null, 2), 'utf-8');
+        await fs.writeFile(OUTPUT_FILE, JSON.stringify({ images: allPosts }), 'utf-8');
         console.log('Done! Data successfully saved.');
     } catch (writeError) {
         console.error('Failed to write to file:', writeError);
