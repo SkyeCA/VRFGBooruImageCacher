@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const express = require('express');
 const axios = require('axios');
 const rateLimit = require('express-rate-limit');
@@ -21,9 +23,14 @@ const LOG_FILE = path.join(__dirname, 'server.log');
 const BOORU_DOMAIN = 'https://vrfg.eu';
 const OUTBOUND_USER_AGENT = 'SkyeCA/VRCWorld/BooruBrowser';
 
+// Post IDs are only ever used to build on-disk cache paths and outbound API
+// URLs, so they're restricted to a safe charset to prevent path traversal
+// (e.g. id=../../../../etc/passwd) reaching fs calls in the endpoints below.
+const VALID_ID_REGEX = /^[A-Za-z0-9_-]+$/;
+
 // Auth Setup
-const BOORU_USERNAME = ''; 
-const BOORU_API_TOKEN = ''; 
+const BOORU_USERNAME = process.env.BOORU_USERNAME || '';
+const BOORU_API_TOKEN = process.env.BOORU_API_TOKEN || '';
 
 // Image Cache Setup
 const CACHE_DIR = path.join(__dirname, 'image_cache');
@@ -44,6 +51,7 @@ if (!fs.existsSync(INFO_CACHE_DIR)) {
 
 // Stats Cache Setup
 const STATS_CACHE_DIR = path.join(__dirname, 'stats_cache');
+const STATS_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // matches the Cache-Control max-age sent below
 
 if (!fs.existsSync(STATS_CACHE_DIR)) {
     fs.mkdirSync(STATS_CACHE_DIR, { recursive: true });
@@ -207,6 +215,18 @@ const enforceVRChatAgent = (req, res, next) => {
     next();
 };
 
+// Rejects malformed/malicious 'id' values before they ever reach the rate
+// limiters or fs/path.join calls (those trust postId is a bare filename).
+const validatePostId = (errorResponder) => (req, res, next) => {
+    const postId = req.query.id;
+    if (postId !== undefined && !VALID_ID_REGEX.test(postId)) {
+        logToFile(`DENIED | Invalid 'id' parameter: ${postId} | IP: ${req.ip}`);
+        res.status(200);
+        return errorResponder(res, "Invalid 'id' parameter");
+    }
+    next();
+};
+
 const imageRateLimiter = rateLimit({
     windowMs: 5 * 1000,
     max: 3,
@@ -259,6 +279,15 @@ const statsRateLimiter = rateLimit({
     }
 });
 
+const checkinRateLimiter = rateLimit({
+    windowMs: 5 * 1000,
+    max: 3,
+    handler: (req, res) => {
+        logToFile(`RATE LIMIT EXCEEDED (/checkin) | IP: ${req.ip}`);
+        res.status(200).json({ error: "Rate Limit Exceeded: Too many requests. Please wait 5 seconds." });
+    }
+});
+
 // ==========================================
 // Endpoints
 // ==========================================
@@ -268,7 +297,7 @@ app.get('/health', (req, res) => {
 });
 
 // --- IMAGE ENDPOINT ---
-app.get('/image', enforceVRChatAgent, imageRateLimiter, async (req, res) => {
+app.get('/image', enforceVRChatAgent, validatePostId((res, msg) => sendErrorImage(res, msg)), imageRateLimiter, async (req, res) => {
     const postId = req.query.id;
 
     if (!postId) {
@@ -280,13 +309,15 @@ app.get('/image', enforceVRChatAgent, imageRateLimiter, async (req, res) => {
 
     try {
         if (fs.existsSync(localFilePath)) {
+            res.setHeader('Content-Type', 'image/jpeg');
             res.setHeader('Cache-Control', 'public, max-age=86400');
             return fs.createReadStream(localFilePath).pipe(res);
         }
 
         if (activeDownloads.has(postId)) {
-            const success = await activeDownloads.get(postId); 
+            const success = await activeDownloads.get(postId);
             if (!success) throw new Error("Previous download attempt failed.");
+            res.setHeader('Content-Type', 'image/jpeg');
             res.setHeader('Cache-Control', 'public, max-age=86400');
             return fs.createReadStream(localFilePath).pipe(res);
         }
@@ -358,6 +389,7 @@ app.get('/image', enforceVRChatAgent, imageRateLimiter, async (req, res) => {
 
         if (!success) throw new Error("Failed to process and cache image.");
 
+        res.setHeader('Content-Type', 'image/jpeg');
         res.setHeader('Cache-Control', 'public, max-age=86400');
         fs.createReadStream(localFilePath).pipe(res);
 
@@ -369,7 +401,7 @@ app.get('/image', enforceVRChatAgent, imageRateLimiter, async (req, res) => {
 });
 
 // --- INFO ENDPOINT ---
-app.get('/info', enforceVRChatAgent, infoRateLimiter, async (req, res) => {
+app.get('/info', enforceVRChatAgent, validatePostId((res, msg) => res.json({ error: msg })), infoRateLimiter, async (req, res) => {
     const postId = req.query.id;
 
     if (!postId) {
@@ -445,9 +477,9 @@ app.get('/stats', enforceVRChatAgent, statsRateLimiter, async (req, res) => {
     try {
         if (fs.existsSync(localFilePath)) {
             const stats = await fs.promises.stat(localFilePath);
-            if (Date.now() - stats.mtimeMs < INFO_CACHE_TTL_MS) {
+            if (Date.now() - stats.mtimeMs < STATS_CACHE_TTL_MS) {
                 res.setHeader('Content-Type', 'application/json');
-                res.setHeader('Cache-Control', 'public, max-age=86400'); 
+                res.setHeader('Cache-Control', 'public, max-age=86400');
                 return fs.createReadStream(localFilePath).pipe(res);
             } else {
                 await fs.promises.unlink(localFilePath).catch(() => {});
@@ -484,7 +516,7 @@ app.get('/stats', enforceVRChatAgent, statsRateLimiter, async (req, res) => {
 });
 
 // --- CHECKIN ENDPOINT ---
-app.get('/checkin', enforceVRChatAgent, (req, res) => {
+app.get('/checkin', enforceVRChatAgent, checkinRateLimiter, (req, res) => {
     const ip = req.ip || req.connection.remoteAddress;
 
     if (!checkinData[ip]) {

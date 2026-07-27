@@ -1,9 +1,11 @@
+require('dotenv').config();
+
 const fs = require('fs/promises');
 
 // Configuration
 const API_BASE_URL = 'https://vrfg.eu';
-const API_USERNAME = ''; // Add your username
-const API_TOKEN = '';  // Your UUID token
+const API_USERNAME = process.env.API_USERNAME || '';
+const API_TOKEN = process.env.API_TOKEN || '';
 const OUTPUT_FILE = 'booru_data.json';
 
 async function scrapeBooru() {
@@ -63,8 +65,8 @@ async function scrapeBooru() {
 
         } catch (error) {
             console.error(`\nAn error occurred while fetching at offset ${offset}:`, error);
-            console.log('Saving what we have so far...');
-            break; 
+            console.error(`Aborting: every page must succeed for the results to be complete. ${OUTPUT_FILE} was NOT written.`);
+            return;
         }
     }
 

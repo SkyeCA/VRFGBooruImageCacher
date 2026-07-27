@@ -1,6 +1,8 @@
 image_cache/
 info_cache/
+stats_cache/
 node_modules/
 server.log
 .DS_Store
 checkins.json
+.env
